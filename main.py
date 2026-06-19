@@ -291,7 +291,16 @@ def handle_text_message(event):
                         reply_str += f"・[{'收入' if rec.record_type == 'income' else '支出'}] ${rec.amount} 元 的 {rec.item}\n"
                     reply_str += "\n👉 正確請回覆「好」，若錯誤請回覆任意文字取消。"
                 elif result.intent == "analyze": 
-                    reply_str = get_monthly_quick_summary_v2(target_id, is_group)
+                    summary_text = get_monthly_quick_summary_v2(target_id, is_group)
+                    
+                    if is_group:
+                        # 👥 群組模式：自動將目前對話的 target_id (也就是 groupId) 當成參數拼接上去
+                        dashboard_url = f"https://你的前端網頁名稱.onrender.com/index.html?groupId={target_id}"
+                        reply_str = f"{summary_text}\n\n🌐 群組專屬財務後台網址：\n{dashboard_url}"
+                    else:
+                        # 👤 個人模式：維持原樣，不需要帶參數
+                        dashboard_url = f"https://你的前端網頁名稱.onrender.com/index.html"
+                        reply_str = f"{summary_text}\n\n🌐 個人專屬雲端帳本：\n{dashboard_url}"
                 elif result.intent == "chat" or result.intent == "sensitive": 
                     reply_str = result.ai_reply
                 else: reply_str = "👌"
