@@ -54,14 +54,19 @@ openai_client = AsyncOpenAI(
 
 # 初始化 Firebase
 cred_path = "firebase-adminsdk.json"
+
 if os.path.exists(cred_path):
-    cred = credentials.Certificate(cred_path)
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print("🔥 Firebase Firestore 初始化成功！")
+    try:
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        print(f"🔥 [DATABASE LOG] 成功讀取 {cred_path}，Firestore 初始化成功！")
+    except Exception as e:
+        db = None
+        print(f"❌ [DATABASE LOG] 找到檔案但初始化崩潰，真兇原因: {e}")
 else:
     db = None
-
+    print(f"❌ [DATABASE LOG] 嚴重錯誤：在雲端根目錄找不到 {cred_path} 檔案！")
 # ==========================================
 # 📊 Pydantic 資料結構定義
 # ==========================================
