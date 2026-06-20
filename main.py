@@ -2,6 +2,7 @@ import os
 import re
 import json
 import random
+import httpx
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import Response
@@ -30,7 +31,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="飯糰小幫手 ｜ 智慧名冊與單號防禦版")
+app = FastAPI(title="飯糰小幫手 ｜ ID與暱稱雙存商業完全體")
 
 # ==========================================
 # ⚙️ 1. 核心客戶端與資料庫初始化
@@ -100,24 +101,38 @@ def send_line_reply(target_id: str, text: str):
     except Exception as e:
         print(f"❌ LINE 推播失敗: {e}", flush=True)
 
+def fetch_line_profile_name(user_id: str) -> str:
+    """🌐 透過 LINE 官方 API 逆查成員真實暱稱 (保底防線)"""
+    url = f"https://api.line.me/v2/bot/profile/{user_id}"
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    try:
+        res = httpx.get(url, headers=headers, timeout=5.0)
+        if res.status_code == 200:
+            return res.json().get("displayName", f"成員({user_id[:4]})")
+    except Exception:
+        pass
+    return f"成員({user_id[:4]})"
+
 def resolve_id_to_name(target_id: str, user_id: str) -> str:
-    """👥 智慧名冊反查：將 LINE UID 換成人類看得懂的 LINE 暱稱"""
-    if not db or not user_id:
-        return "群組夥伴"
-    # 如果傳進來的本身就不是 LINE UID 格式，原樣歸還
-    if not user_id.startswith("U"):
-        return user_id
+    """👥 智慧名冊反查工具：本地快取優先，若無則請求官方 API 並自動回寫快取"""
+    if not db or not user_id: return "群組夥伴"
+    if not user_id.startswith("U"): return user_id
     try:
         member_ref = db.collection("groups").document(target_id).collection("members").document(user_id)
         doc_snap = member_ref.get()
         if doc_snap.exists:
-            return doc_snap.to_dict().get("display_name", f"成員({user_id[:6]})")
+            return doc_snap.to_dict().get("display_name", f"成員({user_id[:4]})")
+        else:
+            # 🚀 本地名冊找不到，主動跟 LINE 要，並且回寫到快取池，下次就不重複呼叫
+            real_name = fetch_line_profile_name(user_id)
+            member_ref.set({"user_id": user_id, "display_name": real_name, "updated_at": datetime.utcnow()})
+            return real_name
     except Exception:
         pass
-    return f"成員({user_id[:6]})"
+    return f"成員({user_id[:4]})"
 
 # ==========================================
-# 🌐 4. Webhook 核心流動（單號防禦與名冊優化）
+# 🌐 4. Webhook 核心主線
 # ==========================================
 @app.post("/callback")
 async def callback(request: Request, background_tasks: BackgroundTasks):
@@ -143,10 +158,9 @@ def handle_text_message(event):
     target_id = event.source.group_id if is_group else creator_id
     root_collection = "groups" if is_group else "users"
 
-    # 📥 讀取或初始化群組狀態機
+    # 📥 讀取或初始化群組狀態
     current_mode = "normal"
     active_code = ""
-    master_payer_id = ""
     
     if is_group:
         group_doc_ref = db.collection("groups").document(target_id)
@@ -155,28 +169,22 @@ def handle_text_message(event):
             g_data = group_snap.to_dict()
             current_mode = g_data.get("state", "normal")
             active_code = g_data.get("active_order_code", "")
-            master_payer_id = g_data.get("master_payer", "")
         else:
             group_doc_ref.set({"group_id": target_id, "state": "normal", "created_at": datetime.utcnow()})
 
-    # ====================================================
-    # 🚨 🛡️ 【全時段被動 Tag 閘門】未被 Tag 助理，一律原地秒阻斷
-    # ====================================================
+    # 🚨 【全時段被動 Tag 閘門】
     is_bot_tagged = False
     mention = getattr(event.message, "mention", None)
-    
     if mention and mention.mentionees: is_bot_tagged = True
     if any(kw in user_text for kw in ["@飯糰", "飯糰"]): is_bot_tagged = True
-        
     if is_group and not is_bot_tagged: return 
 
     # ====================================================
-    # 🎯 🛠️ 【Python 邊緣代打層：單號防禦線與核銷勾稽】
+    # 🎯 🛠️ 【Python 邊緣代打層：核銷雙存同步修正】
     # ====================================================
     is_settle_intent = any(k in user_text for k in ["核銷", "還錢", "平帳", "給錢", "付清"])
     
     if is_group and is_settle_intent:
-        # 🔒 單號防禦：從內文中強行挖出 #1234 形式的 4 位數單號
         code_match = re.search(r'#?(\d{4})', user_text)
         if not code_match:
             send_line_reply(target_id, "⚠️ 請輸入正確的核銷格式！必須包含團購單號才能進行平帳。\n👉 範例：『@飯糰 幫小明核銷 #1234 金額 500』")
@@ -184,7 +192,6 @@ def handle_text_message(event):
             
         req_code = code_match.group(1)
         
-        # 驗證此單號是否存在於資料庫中
         order_found = None
         orders_query = db.collection("groups").document(target_id).collection("orders").where("order_code", "==", req_code).stream()
         for doc_obj in orders_query:
@@ -192,16 +199,14 @@ def handle_text_message(event):
             break
             
         if not order_found:
-            send_line_reply(target_id, f"❌ 核銷失敗！找不到本群組內編號為 #{req_code} 的團購單，請核對單號後再試一次。")
+            send_line_reply(target_id, f"❌ 核銷失敗！找不到本群組內編號為 #{req_code} 的團購單。")
             return
             
-        # 通過單號校驗，正式將群組切換為結算模式
+        # 激活結算模式
         current_mode = "settle"
-        active_code = req_code
-        master_payer_id = order_found.get("master_payer_name", creator_id)
-        db.collection("groups").document(target_id).update({"state": "settle", "active_order_code": req_code, "master_payer": master_payer_id})
+        db.collection("groups").document(target_id).update({"state": "settle", "active_order_code": req_code})
         
-        # 智慧提取被 Tag 成員 (排除發話者與機器人)
+        # 智慧提取被 Tag 成員
         tagged_user_ids = []
         if mention and mention.mentionees:
             for m in mention.mentionees:
@@ -209,67 +214,63 @@ def handle_text_message(event):
                 if u_id and u_id != creator_id:
                     tagged_user_ids.append(u_id)
         
-        # 精準提取金額
+        # 提取金額
         amount_match = re.search(r'(?:金額|付|給|還)?\s*(\d+)\s*(?:元|塊)?', user_text.replace(req_code, ""))
         settle_amount = int(amount_match.group(1)) if amount_match else 0
         if settle_amount == 0:
-            # 備用保底：隨便抓任何一個非單號的數字
             all_nums = re.findall(r'\d+', user_text)
             for n in all_nums:
-                if n != req_code:
-                    settle_amount = int(n)
-                    break
+                if n != req_code: settle_amount = int(n); break
 
         if settle_amount > 0:
-            final_payer = None
-            final_receiver = None
+            final_payer_id = None
+            final_receiver_id = None
             
-            # 🚀 雙 Tag 模式
             if len(tagged_user_ids) >= 2:
-                final_payer = tagged_user_ids[0]
-                final_receiver = tagged_user_ids[1]
-            # 🚀 單 Tag 模式 ➡️ 預設為：被 Tag 的人給發話者（我本人）
+                final_payer_id = tagged_user_ids[0]
+                final_receiver_id = tagged_user_ids[1]
             elif len(tagged_user_ids) == 1:
-                final_payer = tagged_user_ids[0]
-                final_receiver = creator_id
+                final_payer_id = tagged_user_ids[0]
+                final_receiver_id = creator_id
                 
-            if final_payer and final_receiver and final_payer != final_receiver:
+            if final_payer_id and final_receiver_id and final_payer_id != final_receiver_id:
+                # 🚀 【雙存修正核心】反查人類真實暱稱
+                payer_name_str = resolve_id_to_name(target_id, final_payer_id)
+                receiver_name_str = resolve_id_to_name(target_id, final_receiver_id)
+
+                # 寫入資料庫：同時保存 ID 作為 Key，並保存人類暱稱供前端直接勾稽渲染
                 db.collection("groups").document(target_id).collection("settlements").document().set({
-                    "payer_name": final_payer,
-                    "receiver_name": final_receiver,
+                    "payer_id": final_payer_id,
+                    "receiver_id": final_receiver_id,
+                    "payer_name": payer_name_str,       # 🎯 前端網頁與 LINE 對帳單將完美同步顯示此暱稱
+                    "receiver_name": receiver_name_str,   # 🎯 前端網頁與 LINE 對帳單將完美同步顯示此暱稱
                     "amount": settle_amount,
                     "order_code_ref": req_code,
                     "timestamp": datetime.utcnow()
                 })
                 
-                # 👥 這裡呼叫智慧反查，把真實 UID 換成真實 LINE 名字輸出到對話框！
-                payer_name_str = resolve_id_to_name(target_id, final_payer)
-                receiver_name_str = resolve_id_to_name(target_id, final_receiver)
-                
-                send_line_reply(target_id, f"✅ 【單號 #{req_code} 核銷成功】\n🤝 結算模式已對接！\n💸 付款人：{payer_name_str}\n📥 收款人：{receiver_name_str}\n💰 金額：${settle_amount:,} 元 已成功入庫！")
+                send_line_reply(target_id, f"✅ 【單號 #{req_code} 核銷成功】\n💸 付款人：{payer_name_str}\n📥 收款人：{receiver_name_str}\n💰 金額：${settle_amount:,} 元 已成功落庫同步！")
                 return
             else:
-                send_line_reply(target_id, f"⚠️ 已為您切換至單號 #{req_code} 的結算模式，但未偵測到有效的核銷成員，請重新 Tag 團員並輸入金額。")
+                send_line_reply(target_id, f"⚠️ 已為您切換至單號 #{req_code} 結算模式，但核銷成員無效，請重新 Tag 團員。")
                 return
 
-    # 🚀 C. 常態模式下，輸入「報表、查帳、網址、入口」自動派發 LIFF 後台入口
+    # 常態模式下導流入口
     is_report_intent = any(k in user_text for k in ["報表", "查帳", "大後台", "網址", "入口", "登入"])
     if is_group and current_mode == "normal" and is_report_intent:
         dashboard_url = f"https://liff.line.me/{MY_LIFF_ID}?groupId={target_id}"
-        send_line_reply(target_id, f"📊 【飯糰小幫手 ｜ 雲端視覺化公帳後台】\n🟢 本群組專屬即時對帳入口已就緒，請點擊進入查看完整收支與圖表簡報：\n{dashboard_url}")
+        send_line_reply(target_id, f"📊 【飯糰小幫手 ｜ 雲端視覺化公帳後台】\n🟢 入口已就緒：\n{dashboard_url}")
         return
 
-    # 清洗內文送往 Gemini
     user_text = user_text.replace("@飯糰", "").replace("飯糰", "").strip()
 
-    # 🛑 全域敏感字防線
     for kw in SENSITIVE_KEYWORDS:
         if kw in user_text:
             send_line_reply(target_id, "🤖 飯糰助理為純財務系統，請勿探討敏感議題喔！")
             return
 
     # ====================================================
-    # 🧠 🧠 🟨 第二層：Gemini 核心大腦（處理普通收支流水帳）
+    # 🧠 第二層：Gemini 核心大腦（處理點單與記帳雙存）
     # ====================================================
     try:
         prompt = f"""
@@ -289,6 +290,7 @@ def handle_text_message(event):
         # 1. 常態模式普通記帳 (record)
         if result.intent == "record":
             if result.records:
+                creator_name_str = resolve_id_to_name(target_id, creator_id)
                 for rec in result.records:
                     if rec.amount > 0:
                         db.collection(root_collection).document(target_id).collection("expenses").document().set({
@@ -297,9 +299,9 @@ def handle_text_message(event):
                             "item": rec.item, 
                             "category": rec.category,
                             "timestamp": datetime.utcnow(), 
-                            "created_by_name": creator_id  # 資料庫核心依舊保持儲存真實 ID
+                            "created_by_uid": creator_id,
+                            "created_by_name": creator_name_str  # 🎯 雙存：直接寫入真實人類暱稱
                         })
-                creator_name_str = resolve_id_to_name(target_id, creator_id)
                 send_line_reply(target_id, f"👌 收到！已成功幫 {creator_name_str} 登記一筆花費至雲端後台。")
 
         # 2. 開團模式 (order_start)
@@ -313,15 +315,16 @@ def handle_text_message(event):
             if result.order_items:
                 g_ref = db.collection("groups").document(target_id)
                 temp_items = g_ref.get().to_dict().get("order_items_temp", [])
+                creator_name_str = resolve_id_to_name(target_id, creator_id)
                 for item in result.order_items:
                     temp_items.append({
-                        "buyer": creator_id, 
+                        "buyer_id": creator_id,
+                        "buyer": creator_name_str,  # 🎯 雙存：前端對帳單將精準勾稽這個真實姓名字串
                         "item": item.item_name, 
                         "price": item.price, 
                         "timestamp": datetime.utcnow().isoformat()
                     })
                 g_ref.update({"order_items_temp": temp_items})
-                creator_name_str = resolve_id_to_name(target_id, creator_id)
                 send_line_reply(target_id, f"📝 收到！已幫 {creator_name_str} 掛載點單品項。")
 
         # 4. 截止結單 (order_end)
@@ -331,21 +334,22 @@ def handle_text_message(event):
             temp_items = g_data.get("order_items_temp", [])
             
             if temp_items:
-                code_str = g_data.get("active_order_code", str(random.randint(1000, 9999)) if not active_code else active_code)
+                code_str = g_data.get("active_order_code", str(random.randint(1000, 9999)))
                 total_amt = sum(i["price"] for i in temp_items)
+                creator_name_str = resolve_id_to_name(target_id, creator_id)
                 
                 g_ref.collection("orders").document(f"{datetime.now().strftime('%Y%m%d')}_{code_str}").set({
                     "order_date": datetime.now().strftime("%Y-%m-%d"), 
                     "order_code": code_str, 
                     "total_amount": total_amt,
-                    "master_payer_name": creator_id, 
+                    "master_payer_id": creator_id,
+                    "master_payer_name": creator_name_str,  # 🎯 雙存：買單墊款人同步存入暱稱
                     "items": temp_items, 
                     "timestamp": datetime.utcnow()
                 })
-                creator_name_str = resolve_id_to_name(target_id, creator_id)
-                send_line_reply(target_id, f"🏁 【團購截止 ｜ 單號 #{code_str}】\n💰 總金額：${total_amt} 元\n💳 墊款買單：{creator_name_str}\n\n🤖 數據已安全入庫！群組已「恢復正常常態模式」。")
+                send_line_reply(target_id, f"🏁 【團購截止 ｜ 單號 #{code_str}】\n💰 總金額：${total_amt} 元\n💳 墊款買單：{creator_name_str}\n\n🤖 數據已同步更新！群組已恢復常態。")
             else:
-                send_line_reply(target_id, "🛑 因無人叫單，本團已直接關閉，群組已「恢復正常常態模式」。")
+                send_line_reply(target_id, "🛑 因無人叫單，本團已直接關閉。")
                 
             g_ref.update({"state": "normal", "order_items_temp": []})
 
@@ -363,4 +367,4 @@ def handle_text_message(event):
 
 @app.get("/")
 def health_check(): 
-    return {"status": "optimized_v6.6_code_defended", "version": "v6.6-LineNameResolved"}
+    return {"status": "synchronized_dual_saving_active", "version": "v7.0-Final-SaaS"}
