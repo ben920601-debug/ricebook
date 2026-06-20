@@ -31,7 +31,7 @@ app = FastAPI(title="飯糰小幫手 ｜ SaaS 雙軌無消耗核心大腦")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Firebase Firestore 初始化驗證
