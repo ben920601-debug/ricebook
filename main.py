@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="飯糰小幫手 ｜ 雙 Tag 智慧核銷終極完全體")
+app = FastAPI(title="飯糰小幫手 ｜ 智慧名冊與單號防禦版")
 
 # ==========================================
 # ⚙️ 1. 核心客戶端與資料庫初始化
@@ -71,14 +71,14 @@ class SingleRecord(BaseModel):
     note: str = Field(default="")
 
 class SingleSettlement(BaseModel):
-    payer_name: str = Field(description="付出款項還錢的人名字或UID。若自稱我請填寫『發話者』")
-    receiver_name: str = Field(description="收到款項拿回錢的人名字或UID。若自稱我請填寫『發話者』")
+    payer_name: str = Field(default="")
+    receiver_name: str = Field(default="")
     amount: int = Field(default=0)
 
 class GroupOrderItem(BaseModel):
-    buyer_name: str = Field(description="點餐者名字。若自稱我或空白請寫『發話者』")
-    item_name: str = Field(description="品項名稱")
-    price: int = Field(description="單價金額")
+    buyer_name: str = Field(default="")
+    item_name: str = Field(default="")
+    price: int = Field(default=0)
 
 class SuperRouter(BaseModel):
     intent: Literal["record", "chat", "analyze", "sensitive", "settlement", "order_item", "order_end", "order_start", "settle_start", "settle_pay", "settle_query"] = Field(
@@ -100,8 +100,24 @@ def send_line_reply(target_id: str, text: str):
     except Exception as e:
         print(f"❌ LINE 推播失敗: {e}", flush=True)
 
+def resolve_id_to_name(target_id: str, user_id: str) -> str:
+    """👥 智慧名冊反查：將 LINE UID 換成人類看得懂的 LINE 暱稱"""
+    if not db or not user_id:
+        return "群組夥伴"
+    # 如果傳進來的本身就不是 LINE UID 格式，原樣歸還
+    if not user_id.startswith("U"):
+        return user_id
+    try:
+        member_ref = db.collection("groups").document(target_id).collection("members").document(user_id)
+        doc_snap = member_ref.get()
+        if doc_snap.exists:
+            return doc_snap.to_dict().get("display_name", f"成員({user_id[:6]})")
+    except Exception:
+        pass
+    return f"成員({user_id[:6]})"
+
 # ==========================================
-# 🌐 4. Webhook 核心流動（雙 Tag 勾稽核心）
+# 🌐 4. Webhook 核心流動（單號防禦與名冊優化）
 # ==========================================
 @app.post("/callback")
 async def callback(request: Request, background_tasks: BackgroundTasks):
@@ -127,9 +143,10 @@ def handle_text_message(event):
     target_id = event.source.group_id if is_group else creator_id
     root_collection = "groups" if is_group else "users"
 
-    # 📥 A. 讀取或初始化群組狀態機
+    # 📥 讀取或初始化群組狀態機
     current_mode = "normal"
     active_code = ""
+    master_payer_id = ""
     
     if is_group:
         group_doc_ref = db.collection("groups").document(target_id)
@@ -138,74 +155,109 @@ def handle_text_message(event):
             g_data = group_snap.to_dict()
             current_mode = g_data.get("state", "normal")
             active_code = g_data.get("active_order_code", "")
+            master_payer_id = g_data.get("master_payer", "")
         else:
             group_doc_ref.set({"group_id": target_id, "state": "normal", "created_at": datetime.utcnow()})
 
     # ====================================================
-    # 🚨 🛡️ 【全時段被動 Tag 閘門】群組內未被 Tag 助理，一律原地秒阻斷
+    # 🚨 🛡️ 【全時段被動 Tag 閘門】未被 Tag 助理，一律原地秒阻斷
     # ====================================================
     is_bot_tagged = False
     mention = getattr(event.message, "mention", None)
     
-    # 檢查有沒有 Tag 訊號
-    if mention and mention.mentionees:
-        is_bot_tagged = True
-    if any(kw in user_text for kw in ["@飯糰", "飯糰"]):
-        is_bot_tagged = True
+    if mention and mention.mentionees: is_bot_tagged = True
+    if any(kw in user_text for kw in ["@飯糰", "飯糰"]): is_bot_tagged = True
         
-    if is_group and not is_bot_tagged:
-        return 
+    if is_group and not is_bot_tagged: return 
 
     # ====================================================
-    # 🎯 🛠️ 【Python 邊緣代打層：雙 Tag 勾稽與核銷意圖攔截】
+    # 🎯 🛠️ 【Python 邊緣代打層：單號防禦線與核銷勾稽】
     # ====================================================
     is_settle_intent = any(k in user_text for k in ["核銷", "還錢", "平帳", "給錢", "付清"])
     
     if is_group and is_settle_intent:
-        # 1. 自動把群組模式切換為結算模式 (settle)
-        current_mode = "settle"
-        db.collection("groups").document(target_id).update({"state": "settle"})
+        # 🔒 單號防禦：從內文中強行挖出 #1234 形式的 4 位數單號
+        code_match = re.search(r'#?(\d{4})', user_text)
+        if not code_match:
+            send_line_reply(target_id, "⚠️ 請輸入正確的核銷格式！必須包含團購單號才能進行平帳。\n👉 範例：『@飯糰 幫小明核銷 #1234 金額 500』")
+            return
+            
+        req_code = code_match.group(1)
         
-        # 2. 智慧提取訊息內含的所有真實 LINE user_id (排除機器人自己)
+        # 驗證此單號是否存在於資料庫中
+        order_found = None
+        orders_query = db.collection("groups").document(target_id).collection("orders").where("order_code", "==", req_code).stream()
+        for doc_obj in orders_query:
+            order_found = doc_obj.to_dict()
+            break
+            
+        if not order_found:
+            send_line_reply(target_id, f"❌ 核銷失敗！找不到本群組內編號為 #{req_code} 的團購單，請核對單號後再試一次。")
+            return
+            
+        # 通過單號校驗，正式將群組切換為結算模式
+        current_mode = "settle"
+        active_code = req_code
+        master_payer_id = order_found.get("master_payer_name", creator_id)
+        db.collection("groups").document(target_id).update({"state": "settle", "active_order_code": req_code, "master_payer": master_payer_id})
+        
+        # 智慧提取被 Tag 成員 (排除發話者與機器人)
         tagged_user_ids = []
         if mention and mention.mentionees:
             for m in mention.mentionees:
                 u_id = getattr(m, "user_id", None)
-                if u_id and u_id != creator_id:  # 排除發話者自己
+                if u_id and u_id != creator_id:
                     tagged_user_ids.append(u_id)
         
-        # 3. 從內文中精準挖出金額
-        amount_match = re.search(r'\d+', user_text)
-        settle_amount = int(amount_match.group()) if amount_match else 0
-        
+        # 精準提取金額
+        amount_match = re.search(r'(?:金額|付|給|還)?\s*(\d+)\s*(?:元|塊)?', user_text.replace(req_code, ""))
+        settle_amount = int(amount_match.group(1)) if amount_match else 0
+        if settle_amount == 0:
+            # 備用保底：隨便抓任何一個非單號的數字
+            all_nums = re.findall(r'\d+', user_text)
+            for n in all_nums:
+                if n != req_code:
+                    settle_amount = int(n)
+                    break
+
         if settle_amount > 0:
             final_payer = None
             final_receiver = None
             
-            # 🚀 規則 A：偵測到 2 個以上的有效群組成員 Tag 訊號
+            # 🚀 雙 Tag 模式
             if len(tagged_user_ids) >= 2:
-                final_payer = tagged_user_ids[0]      # 第一個被 Tag 的人是還錢者
-                final_receiver = tagged_user_ids[1]   # 第二個被 Tag 的人是收錢者
-            
-            # 🚀 規則 B：少於 2 個 Tag ➡️ 預設為【被 Tag 的那個人】給【發話者（你本人）】
+                final_payer = tagged_user_ids[0]
+                final_receiver = tagged_user_ids[1]
+            # 🚀 單 Tag 模式 ➡️ 預設為：被 Tag 的人給發話者（我本人）
             elif len(tagged_user_ids) == 1:
-                final_payer = tagged_user_ids[0]      # 被 Tag 的人付錢
-                final_receiver = creator_id           # 發話者（我本人）收錢
+                final_payer = tagged_user_ids[0]
+                final_receiver = creator_id
                 
             if final_payer and final_receiver and final_payer != final_receiver:
-                # 🔒 全面寫入真實 LINE ID 進入資料庫，保證前後端對帳永不失聯！
                 db.collection("groups").document(target_id).collection("settlements").document().set({
-                    "payer_name": final_payer,      # 寫入真實還錢者 LINE ID
-                    "receiver_name": final_receiver,  # 寫入真實收錢者 LINE ID
+                    "payer_name": final_payer,
+                    "receiver_name": final_receiver,
                     "amount": settle_amount,
-                    "order_code_ref": active_code if active_code else "日常平帳",
+                    "order_code_ref": req_code,
                     "timestamp": datetime.utcnow()
                 })
-                send_line_reply(target_id, f"👌 收到！已切換為【結算模式】並完成帳目核銷！\n💸 付款人：(LINE_ID: {final_payer[:8]}...)\n📥 收款人：(LINE_ID: {final_receiver[:8]}...)\n💰 金額：${settle_amount} 元 已成功落庫！")
+                
+                # 👥 這裡呼叫智慧反查，把真實 UID 換成真實 LINE 名字輸出到對話框！
+                payer_name_str = resolve_id_to_name(target_id, final_payer)
+                receiver_name_str = resolve_id_to_name(target_id, final_receiver)
+                
+                send_line_reply(target_id, f"✅ 【單號 #{req_code} 核銷成功】\n🤝 結算模式已對接！\n💸 付款人：{payer_name_str}\n📥 收款人：{receiver_name_str}\n💰 金額：${settle_amount:,} 元 已成功入庫！")
                 return
             else:
-                send_line_reply(target_id, "⚠️ 核銷失敗！請至少 Tag 一位成員並輸入正確的還款金額。")
+                send_line_reply(target_id, f"⚠️ 已為您切換至單號 #{req_code} 的結算模式，但未偵測到有效的核銷成員，請重新 Tag 團員並輸入金額。")
                 return
+
+    # 🚀 C. 常態模式下，輸入「報表、查帳、網址、入口」自動派發 LIFF 後台入口
+    is_report_intent = any(k in user_text for k in ["報表", "查帳", "大後台", "網址", "入口", "登入"])
+    if is_group and current_mode == "normal" and is_report_intent:
+        dashboard_url = f"https://liff.line.me/{MY_LIFF_ID}?groupId={target_id}"
+        send_line_reply(target_id, f"📊 【飯糰小幫手 ｜ 雲端視覺化公帳後台】\n🟢 本群組專屬即時對帳入口已就緒，請點擊進入查看完整收支與圖表簡報：\n{dashboard_url}")
+        return
 
     # 清洗內文送往 Gemini
     user_text = user_text.replace("@飯糰", "").replace("飯糰", "").strip()
@@ -217,7 +269,7 @@ def handle_text_message(event):
             return
 
     # ====================================================
-    # 🧠 🧠 🟨 第二層：Gemini 核心大腦（處理開閉團與普通記帳）
+    # 🧠 🧠 🟨 第二層：Gemini 核心大腦（處理普通收支流水帳）
     # ====================================================
     try:
         prompt = f"""
@@ -226,9 +278,7 @@ def handle_text_message(event):
         
         【分流任務】：
         1. 判定 intent (record, order_start, order_end, order_item, chat)。
-        2. 包含開團、團購開始，為 order_start。
-        3. 包含截止、結單、團購結束，為 order_end。
-        4. 純輸入金額項目（如：早餐 200），為 "record"。
+        2. 純輸入金額項目（如：晚餐 350），為 "record"。
         """
 
         result = ai_client.models.generate_content(
@@ -236,7 +286,7 @@ def handle_text_message(event):
             config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=SuperRouter, temperature=0.1),
         ).parsed
 
-        # 1. 常態模式普通記帳 (record) ➡️ Payer 改抓真實 LINE ID
+        # 1. 常態模式普通記帳 (record)
         if result.intent == "record":
             if result.records:
                 for rec in result.records:
@@ -247,23 +297,23 @@ def handle_text_message(event):
                             "item": rec.item, 
                             "category": rec.category,
                             "timestamp": datetime.utcnow(), 
-                            "created_by_name": creator_id  # 🎯 修正：全面改抓發話者真實 LINE ID
+                            "created_by_name": creator_id  # 資料庫核心依舊保持儲存真實 ID
                         })
-                send_line_reply(target_id, "👌 收到！已成功幫您記錄這筆花費至雲端後台。")
+                creator_name_str = resolve_id_to_name(target_id, creator_id)
+                send_line_reply(target_id, f"👌 收到！已成功幫 {creator_name_str} 登記一筆花費至雲端後台。")
 
         # 2. 開團模式 (order_start)
         elif result.intent == "order_start" and is_group:
             code_str = str(random.randint(1000, 9999))
             db.collection("groups").document(target_id).update({"state": "order", "active_order_code": code_str, "order_items_temp": []})
-            send_line_reply(target_id, f"🚀 【飯團團購模式・正式啟動】\n🔢 本團結算編號：#{code_str}\n👉 請大家點單時同樣記得「@飯糰 品項 金額」叫單喔！")
+            send_line_reply(target_id, f"🚀 【飯團團購模式・正式啟動】\n🔢 本團結算編號：#{code_str}\n👉 請大家叫單時記得「@飯糰 品項 金額」喔！")
 
-        # 3. 點餐品項蒐集 (order_item) ➡️ Buyer 改抓真實 LINE ID
+        # 3. 點餐品項蒐集 (order_item)
         elif result.intent == "order_item" and current_mode == "order" and is_group:
             if result.order_items:
                 g_ref = db.collection("groups").document(target_id)
                 temp_items = g_ref.get().to_dict().get("order_items_temp", [])
                 for item in result.order_items:
-                    # 🎯 修正：不論自稱是誰，一律強制抓取發話者的真實 LINE ID 存入
                     temp_items.append({
                         "buyer": creator_id, 
                         "item": item.item_name, 
@@ -271,35 +321,35 @@ def handle_text_message(event):
                         "timestamp": datetime.utcnow().isoformat()
                     })
                 g_ref.update({"order_items_temp": temp_items})
-                send_line_reply(target_id, "📝 收到！已幫您掛載點單品項。")
+                creator_name_str = resolve_id_to_name(target_id, creator_id)
+                send_line_reply(target_id, f"📝 收到！已幫 {creator_name_str} 掛載點單品項。")
 
-        # 4. 截止結單 (order_end) ➡️ 自動恢復正常常態模式
+        # 4. 截止結單 (order_end)
         elif result.intent == "order_end" and current_mode == "order" and is_group:
             g_ref = db.collection("groups").document(target_id)
             g_data = g_ref.get().to_dict()
             temp_items = g_data.get("order_items_temp", [])
             
             if temp_items:
-                code_str = g_data.get("active_order_code", str(random.randint(1000, 9999)))
+                code_str = g_data.get("active_order_code", str(random.randint(1000, 9999)) if not active_code else active_code)
                 total_amt = sum(i["price"] for i in temp_items)
                 
-                # 正式寫入資料庫 orders 封存 (買單墊款人直接鎖定為結單者的真實 LINE ID)
                 g_ref.collection("orders").document(f"{datetime.now().strftime('%Y%m%d')}_{code_str}").set({
                     "order_date": datetime.now().strftime("%Y-%m-%d"), 
                     "order_code": code_str, 
                     "total_amount": total_amt,
-                    "master_payer_name": creator_id,  # 🎯 修正：墊款人綁定真實 LINE ID
+                    "master_payer_name": creator_id, 
                     "items": temp_items, 
                     "timestamp": datetime.utcnow()
                 })
-                send_line_reply(target_id, f"🏁 【團購截止 ｜ 單號 #{code_str}】\n💰 總金額：${total_amt} 元\n💳 墊款買單人：(LINE_ID: {creator_id[:8]}...)\n\n🤖 數據已安全封存！群組已「恢復正常常態模式」。")
+                creator_name_str = resolve_id_to_name(target_id, creator_id)
+                send_line_reply(target_id, f"🏁 【團購截止 ｜ 單號 #{code_str}】\n💰 總金額：${total_amt} 元\n💳 墊款買單：{creator_name_str}\n\n🤖 數據已安全入庫！群組已「恢復正常常態模式」。")
             else:
                 send_line_reply(target_id, "🛑 因無人叫單，本團已直接關閉，群組已「恢復正常常態模式」。")
                 
-            # 🎯 截止收單後，狀態機強制恢復成 normal 常態模式
             g_ref.update({"state": "normal", "order_items_temp": []})
 
-        # 5. 手動關閉結算模式，回歸常態
+        # 5. 手動關閉結算模式
         elif "結算結束" in user_text and current_mode == "settle" and is_group:
             db.collection("groups").document(target_id).update({"state": "normal"})
             send_line_reply(target_id, "🔓 結算完畢！群組已「恢復正常常態模式」。")
@@ -313,4 +363,4 @@ def handle_text_message(event):
 
 @app.get("/")
 def health_check(): 
-    return {"status": "double_tag_settle_active", "version": "v6.5-SaaS-LineIDLocked"}
+    return {"status": "optimized_v6.6_code_defended", "version": "v6.6-LineNameResolved"}
