@@ -9,14 +9,14 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from typing import Literal, List, Optional
 
-# LINE SDK v3 
+# LINE SDK v3
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration,
     ApiClient,
     MessagingApi,
-    ReplyMessageRequest,  # 🎯 新增：引進免費無限回覆通行證
+    ReplyMessageRequest,
     TextMessage
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="記帳米粒 ｜ 無限回覆抗 429 終極版")
+app = FastAPI(title="記帳米粒 ｜ 極速攔截與 AI 陪聊版")
 
 # ==========================================
 # ⚙️ 1. 核心客戶端與資料庫初始化
@@ -57,7 +57,7 @@ if os.path.exists("firebase-adminsdk.json"):
         print(f"❌ [DATABASE] 連線初始化異常: {e}", flush=True)
 else:
     db = None
-    print("❌ [DATABASE] 嚴重錯誤：根目錄未尋獲 firebase-adminsdk.json！", flush=True)
+    print("❌ [DATABASE] 嚴重錯誤：未尋獲 firebase-adminsdk.json！", flush=True)
 
 # ==========================================
 # 🛡️ 2. 全域型別定義
@@ -69,7 +69,6 @@ class SingleRecord(BaseModel):
     amount: int = Field(default=0)
     item: str = Field(default="")
     category: str = Field(default="生活雜費")
-    note: str = Field(default="")
 
 class SingleSettlement(BaseModel):
     payer_name: str = Field(default="")
@@ -82,19 +81,17 @@ class GroupOrderItem(BaseModel):
     price: int = Field(default=0)
 
 class SuperRouter(BaseModel):
-    intent: Literal["record", "chat", "analyze", "sensitive", "settlement", "order_item", "order_end", "order_start", "settle_start", "settle_pay", "settle_query"] = Field(
+    intent: Literal["record", "chat", "order_start", "order_end", "order_item", "settle_start", "settle_pay", "settle_end"] = Field(
         description="核心意圖分流"
     )
     records: Optional[List[SingleRecord]] = Field(default_factory=list)
     settlement: Optional[SingleSettlement] = Field(default=None)
     order_items: Optional[List[GroupOrderItem]] = Field(default_factory=list)
-    target_payer: Optional[str] = Field(default="")
-    ai_reply: Optional[str] = Field(default="")
+    ai_reply: Optional[str] = Field(default="", description="與使用者的聊天回應")
 
 # ==========================================
 # ⚡ 3. 核心工具組
 # ==========================================
-# 🎯 核心修正：將 target_id 改為 reply_token，並使用 reply_message 避開 429 限制與收費！
 def send_line_reply(reply_token: str, text: str):
     try:
         with ApiClient(line_config) as api_client:
@@ -154,12 +151,11 @@ def handle_text_message(event):
     user_text = event.message.text.strip()
     creator_id = event.source.user_id 
     is_group = event.source.type == "group"
-    reply_token = event.reply_token  # 🎯 提取專屬回覆通行證
+    reply_token = event.reply_token 
     
     target_id = event.source.group_id if is_group else creator_id
     root_collection = "groups" if is_group else "users"
 
-    # 📥 讀取或初始化群組狀態
     current_mode = "normal"
     active_code = ""
     
@@ -173,58 +169,46 @@ def handle_text_message(event):
         else:
             group_doc_ref.set({"group_id": target_id, "state": "normal", "created_at": datetime.utcnow()})
 
-    # 🚨 【全時段被動 Tag 閘門】
     is_bot_tagged = False
     mention = getattr(event.message, "mention", None)
     if mention and mention.mentionees: is_bot_tagged = True
     if any(kw in user_text for kw in ["@記帳米粒", "記帳米粒"]): is_bot_tagged = True
     if is_group and not is_bot_tagged: return 
 
-    # ====================================================
-    # 🎯 🛠️ 【Python 第一層防禦：核銷鎖定與動態防溢繳】
-    # ====================================================
+    # 1. 核銷申請與防呆邏輯
     is_settle_trigger = any(k in user_text for k in ["核銷", "還錢", "平帳", "給錢", "付清"])
-    
-    # 1. 申請進入結算模式
     if is_group and current_mode == "normal" and is_settle_trigger:
         code_match = re.search(r'#?(\d{4})', user_text)
         if not code_match:
-            send_line_reply(reply_token, "⚠️ 進入結算失敗！必須輸入對應的 4 位數團購單號才可開啟核銷模式。\n👉 範例：『@記帳米粒 申請核銷 #1234』")
+            send_line_reply(reply_token, "⚠️ 必須輸入對應的 4 位數團購單號才可開啟核銷模式。\n👉 範例：『@記帳米粒 申請核銷 #1234』")
             return
             
         req_code = code_match.group(1)
         order_found = None
         orders_query = db.collection("groups").document(target_id).collection("orders").where("order_code", "==", req_code).stream()
-        for doc_obj in orders_query:
-            order_found = doc_obj.to_dict()
-            break
+        for doc_obj in orders_query: order_found = doc_obj.to_dict(); break
             
         if not order_found:
-            send_line_reply(reply_token, f"❌ 錯誤！找不到本群組內編號為 #{req_code} 的團購單。")
+            send_line_reply(reply_token, f"❌ 找不到本群組內編號為 #{req_code} 的團購單。")
             return
             
-        current_mode = "settle"
-        active_code = req_code
         db.collection("groups").document(target_id).update({"state": "settle", "active_order_code": req_code})
         payer_str = resolve_id_to_name(target_id, order_found.get('master_payer_id', creator_id))
-        send_line_reply(reply_token, f"🔓 成功解鎖！群組已進入【結算模式】，當下僅鎖定單號：#{req_code}\n💳 墊款買單人：{payer_str}\n👉 請開始核銷對帳（範例：@記帳米粒 @小明 給我 150）")
+        send_line_reply(reply_token, f"🔓 成功解鎖結算模式！鎖定單號：#{req_code}\n💳 墊款買單人：{payer_str}\n👉 請開始核銷對帳（如：@記帳米粒 @小明 給我 150）")
         return
 
-    # 2. 結算模式下的互動核銷防線
+    # 2. 結算模式互相核銷防線
     if is_group and current_mode == "settle":
         if any(k in user_text for k in ["結算結束", "關閉結算", "退出結算", "核銷完畢"]):
             db.collection("groups").document(target_id).update({"state": "normal", "active_order_code": ""})
-            send_line_reply(reply_token, "🔓 結算完畢！群組已安全登出，恢復【正常常態模式】。")
+            send_line_reply(reply_token, "🔓 結算完畢！已恢復常態模式。")
             return
 
         if any(k in user_text for k in ["給", "還", "付", "收", "核銷"]):
             clean_text = re.sub(r'#?\d{4}', '', user_text)
             amount_match = re.search(r'\d+', clean_text)
             settle_amount = int(amount_match.group()) if amount_match else 0
-            
-            if settle_amount <= 0:
-                send_line_reply(reply_token, "⚠️ 請輸入正確的核銷金額！")
-                return
+            if settle_amount <= 0: return
 
             tagged_user_ids = []
             if mention and mention.mentionees:
@@ -232,114 +216,130 @@ def handle_text_message(event):
                     u_id = getattr(m, "user_id", None)
                     if u_id and u_id != creator_id: tagged_user_ids.append(u_id)
 
-            final_payer_id = None
-            final_receiver_id = None
-            
-            if len(tagged_user_ids) >= 1:
-                final_payer_id = tagged_user_ids[0]
-                final_receiver_id = tagged_user_ids[1] if len(tagged_user_ids) >= 2 else creator_id
+            final_payer_id = tagged_user_ids[0] if len(tagged_user_ids) >= 1 else None
+            final_receiver_id = tagged_user_ids[1] if len(tagged_user_ids) >= 2 else (creator_id if final_payer_id else None)
                 
             if final_payer_id and final_receiver_id and final_payer_id != final_receiver_id:
                 order_query = db.collection("groups").document(target_id).collection("orders").where("order_code", "==", active_code).stream()
                 current_order = None
                 for doc_obj in order_query: current_order = doc_obj.to_dict(); break
+                if not current_order: return
                 
-                if not current_order:
-                    send_line_reply(reply_token, "❌ 勾稽錯誤：找不到該活躍單號的原始開銷明細。")
-                    return
-                
-                payer_expected_total = 0
-                for item in current_order.get("items", []):
-                    if item.get("buyer_id") == final_payer_id or item.get("buyer") == final_payer_id:
-                        payer_expected_total += item.get("price", 0)
-                
+                payer_expected_total = sum(item.get("price", 0) for item in current_order.get("items", []) if item.get("buyer_id") == final_payer_id or item.get("buyer") == final_payer_id)
                 history_settles = db.collection("groups").document(target_id).collection("settlements").where("order_code_ref", "==", active_code).where("payer_id", "==", final_payer_id).stream()
                 payer_already_paid = sum(doc_obj.to_dict().get("amount", 0) for doc_obj in history_settles)
                 
                 remaining_debt = payer_expected_total - payer_already_paid
                 
                 if remaining_debt <= 0:
-                    send_line_reply(reply_token, f"❌ 登記拒絕！成員 {resolve_id_to_name(target_id, final_payer_id)} 在單號 #{active_code} 中並無欠款紀錄。")
+                    send_line_reply(reply_token, f"❌ 登記拒絕！該成員在單號 #{active_code} 中並無欠款紀錄。")
                     return
                 elif settle_amount > remaining_debt:
-                    send_line_reply(reply_token, f"❌ 入帳失敗！金額超過欠款上限！\n⚠️ 該成員此單賸餘應付為：${remaining_debt} 元，您輸入的 ${settle_amount} 元不符合規範，拒絕入帳。")
+                    send_line_reply(reply_token, f"❌ 入帳失敗！輸入的 ${settle_amount} 元超過該成員賸餘應付 ${remaining_debt} 元，拒絕入帳。")
                     return
                 
                 payer_name_str = resolve_id_to_name(target_id, final_payer_id)
                 receiver_name_str = resolve_id_to_name(target_id, final_receiver_id)
 
                 db.collection("groups").document(target_id).collection("settlements").document().set({
-                    "payer_id": final_payer_id,
-                    "receiver_id": final_receiver_id,
-                    "payer_name": payer_name_str,       
-                    "receiver_name": receiver_name_str,   
-                    "amount": settle_amount,
-                    "order_code_ref": active_code,
-                    "timestamp": datetime.utcnow()
+                    "payer_id": final_payer_id, "receiver_id": final_receiver_id,
+                    "payer_name": payer_name_str, "receiver_name": receiver_name_str,   
+                    "amount": settle_amount, "order_code_ref": active_code, "timestamp": datetime.utcnow()
                 })
-                
-                send_line_reply(reply_token, f"✅ 【單號 #{active_code} 核銷成功】\n💸 付款人：{payer_name_str}\n📥 收款人：{receiver_name_str}\n💰 登記金額：${settle_amount} 元 已入庫！")
+                send_line_reply(reply_token, f"✅ 【單號 #{active_code} 核銷成功】\n💸 付款：{payer_name_str}\n📥 收款：{receiver_name_str}\n💰 紀錄金額：${settle_amount}")
                 return
             else:
                 send_line_reply(reply_token, "⚠️ 核銷成員無效，請確保至少 Tag 一名成員。")
                 return
 
-    # 常態模式下導流入口
-    is_report_intent = any(k in user_text for k in ["報表", "查帳", "大後台", "網址", "入口", "登入"])
+    clean_text = user_text.replace("@記帳米粒", "").replace("記帳米粒", "").strip()
+
+    # 常態模式大後台入口
+    is_report_intent = any(k in clean_text for k in ["報表", "查帳", "大後台", "網址", "入口", "登入"])
     if is_group and current_mode == "normal" and is_report_intent:
-        dashboard_url = f"https://liff.line.me/{MY_LIFF_ID}?groupId={target_id}"
-        send_line_reply(reply_token, f"📊 【記帳米粒 ｜ 雲端監控後台】\n🟢 入口如下：\n{dashboard_url}")
+        send_line_reply(reply_token, f"📊 【記帳米粒 ｜ 雲端監控後台】\n🟢 入口如下：\nhttps://liff.line.me/{MY_LIFF_ID}?groupId={target_id}")
         return
 
-    user_text = user_text.replace("@記帳米粒", "").replace("記帳米粒", "").strip()
-
     for kw in SENSITIVE_KEYWORDS:
-        if kw in user_text:
-            send_line_reply(reply_token, "🤖 米粒僅為小小的記帳員，請勿探討敏感議題喔！")
+        if kw in clean_text:
+            send_line_reply(reply_token, "🤖 米粒為純財務助理，請勿探討敏感議題喔！")
             return
 
     # ====================================================
-    # 🧠 第二層：Gemini 核心大腦（處理點單與記帳雙存）
+    # ⚡ 🚀 【Python 第一層極速攔截：標準格式免 AI 直通落庫】
+    # ====================================================
+    # 嚴格匹配「文字 + 數字」組合 (例如：早餐 200、高鐵1300、飲料 50元)
+    fast_match = re.fullmatch(r'^(.+?)\s*(\d+)\s*(?:元|塊)?$', clean_text)
+    if fast_match and current_mode in ["normal", "order"]:
+        item_name = fast_match.group(1).strip()
+        amount = int(fast_match.group(2))
+        
+        # 避免誤將純數字或單號視為物品
+        if not item_name.isdigit() and amount > 0:
+            creator_name_str = resolve_id_to_name(target_id, creator_id)
+            
+            if current_mode == "normal":
+                db.collection(root_collection).document(target_id).collection("expenses").document().set({
+                    "type": "expense", "amount": amount, "item": item_name, "category": "生活雜費",
+                    "timestamp": datetime.utcnow(), "created_by_uid": creator_id, "created_by_name": creator_name_str
+                })
+                # 純 Python 極速回覆，完全不消耗 AI 資源
+                send_line_reply(reply_token, f"✅ 已紀錄：{item_name} ${amount}")
+                return
+                
+            elif current_mode == "order" and is_group:
+                g_ref = db.collection("groups").document(target_id)
+                temp_items = g_ref.get().to_dict().get("order_items_temp", [])
+                temp_items.append({
+                    "buyer_id": creator_id, "buyer": creator_name_str,
+                    "item": item_name, "price": amount, "timestamp": datetime.utcnow().isoformat()
+                })
+                g_ref.update({"order_items_temp": temp_items})
+                send_line_reply(reply_token, f"📝 已點單：{item_name} ${amount}")
+                return
+
+    # ====================================================
+    # 🧠 🧠 【第二層：Gemini 核心大腦 - 複雜萃取與自然陪聊】
     # ====================================================
     try:
         prompt = f"""
-        你是一個高效的財務助理「記帳米粒」。目前位於【{root_collection}】環境，模式為【{current_mode}】。
-        請分析使用者訊息：『{user_text}』
+        你是一個親切、幽默的記帳助理「記帳米粒」。目前位於【{root_collection}】環境，模式為【{current_mode}】。
+        使用者輸入了訊息：『{clean_text}』
         
         【分流任務】：
         1. 判定 intent (record, order_start, order_end, order_item, chat)。
-        2. 純輸入金額項目（如：晚餐 350），為 "record"。
+        2. 如果對話中包含「花費項目與金額」（例如：今天吃早餐花了200元覺得好貴），請提取出紀錄 (intent="record")，並在 ai_reply 中給予簡短、親切的聊天回覆（例如：幫您記上囉！這家好吃嗎？）。
+        3. 如果是純閒聊（無具體花費金額），intent="chat"，請在 ai_reply 陪使用者自然對話。
+        4. 開團(order_start) 或 結單(order_end) 等控制指令，也請在 ai_reply 給予親切的確認回覆。
         """
 
         result = ai_client.models.generate_content(
             model='gemini-2.5-flash', contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=SuperRouter, temperature=0.1),
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=SuperRouter, temperature=0.3),
         ).parsed
 
-        # 1. 常態模式普通記帳 (record)
+        # 1. AI 萃取記帳與陪聊 (record)
         if result.intent == "record":
             if result.records:
                 creator_name_str = resolve_id_to_name(target_id, creator_id)
                 for rec in result.records:
                     if rec.amount > 0:
                         db.collection(root_collection).document(target_id).collection("expenses").document().set({
-                            "type": rec.record_type, 
-                            "amount": rec.amount, 
-                            "item": rec.item, 
-                            "category": rec.category,
-                            "timestamp": datetime.utcnow(), 
-                            "created_by_uid": creator_id,
-                            "created_by_name": creator_name_str
+                            "type": rec.record_type, "amount": rec.amount, "item": rec.item, "category": rec.category,
+                            "timestamp": datetime.utcnow(), "created_by_uid": creator_id, "created_by_name": creator_name_str
                         })
-                send_line_reply(reply_token, f"👌 收到！已成功幫 {creator_name_str} 登記一筆花費至雲端後台。")
+                # AI 自動生成的人性化聊天回覆
+                reply_text = result.ai_reply if result.ai_reply else f"✅ 已為您紀錄花費。"
+                send_line_reply(reply_token, f"🤖 {reply_text}")
 
         # 2. 開團模式 (order_start)
         elif result.intent == "order_start" and is_group:
             code_str = str(random.randint(1000, 9999))
             db.collection("groups").document(target_id).update({"state": "order", "active_order_code": code_str, "order_items_temp": []})
-            send_line_reply(reply_token, f"🚀 【團購模式已啟動】\n🔢 本團結算編號：#{code_str}\n👉 請大家叫單時記得「@記帳米粒 品項 金額」喔！")
+            reply_text = result.ai_reply if result.ai_reply else f"🚀 【團購已啟動】本團單號：#{code_str}\n👉 請大家叫單時記得「@記帳米粒 品項 金額」喔！"
+            send_line_reply(reply_token, reply_text)
 
-        # 3. 點餐品項蒐集 (order_item)
+        # 3. 點單萃取 (order_item)
         elif result.intent == "order_item" and current_mode == "order" and is_group:
             if result.order_items:
                 g_ref = db.collection("groups").document(target_id)
@@ -347,14 +347,12 @@ def handle_text_message(event):
                 creator_name_str = resolve_id_to_name(target_id, creator_id)
                 for item in result.order_items:
                     temp_items.append({
-                        "buyer_id": creator_id,
-                        "buyer": creator_name_str,
-                        "item": item.item_name, 
-                        "price": item.price, 
-                        "timestamp": datetime.utcnow().isoformat()
+                        "buyer_id": creator_id, "buyer": creator_name_str,
+                        "item": item.item_name, "price": item.price, "timestamp": datetime.utcnow().isoformat()
                     })
                 g_ref.update({"order_items_temp": temp_items})
-                send_line_reply(reply_token, f"📝 收到！已幫 {creator_name_str} 掛載點單品項。")
+                reply_text = result.ai_reply if result.ai_reply else f"📝 已幫 {creator_name_str} 掛載點單。"
+                send_line_reply(reply_token, f"🤖 {reply_text}")
 
         # 4. 截止結單 (order_end)
         elif result.intent == "order_end" and current_mode == "order" and is_group:
@@ -368,21 +366,17 @@ def handle_text_message(event):
                 creator_name_str = resolve_id_to_name(target_id, creator_id)
                 
                 g_ref.collection("orders").document(f"{datetime.now().strftime('%Y%m%d')}_{code_str}").set({
-                    "order_date": datetime.now().strftime("%Y-%m-%d"), 
-                    "order_code": code_str, 
-                    "total_amount": total_amt,
-                    "master_payer_id": creator_id,
-                    "master_payer_name": creator_name_str,
-                    "items": temp_items, 
-                    "timestamp": datetime.utcnow()
+                    "order_date": datetime.now().strftime("%Y-%m-%d"), "order_code": code_str, "total_amount": total_amt,
+                    "master_payer_id": creator_id, "master_payer_name": creator_name_str, "items": temp_items, "timestamp": datetime.utcnow()
                 })
-                send_line_reply(reply_token, f"🏁 【團購截止 ｜ 單號 #{code_str}】\n💰 總金額：${total_amt} 元\n💳 墊款買單：{creator_name_str}\n\n🤖 數據已更新！已恢復正常模式。")
+                reply_text = result.ai_reply if result.ai_reply else f"🏁 【團購截止 ｜ 單號 #{code_str}】\n💰 總金額：${total_amt} 元\n💳 墊款：{creator_name_str}\n\n🤖 數據已更新！已恢復正常模式。"
+                send_line_reply(reply_token, reply_text)
             else:
                 send_line_reply(reply_token, "🛑 因無人叫單，本團已直接關閉。")
                 
             g_ref.update({"state": "normal", "order_items_temp": []})
 
-        # 5. 簡單閒聊
+        # 5. 純粹對話陪聊 (chat)
         elif result.intent == "chat" and result.ai_reply:
             send_line_reply(reply_token, f"🤖 {result.ai_reply}")
 
@@ -391,4 +385,4 @@ def handle_text_message(event):
 
 @app.get("/")
 def health_check(): 
-    return {"status": "reply_token_active", "version": "v8.1-SaaS-NoLimits"}
+    return {"status": "fast_regex_active", "version": "v9.0-Chatty-Assistant"}
