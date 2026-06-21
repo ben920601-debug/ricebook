@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="記帳米粒 ｜ 無痕智慧開團版")
+app = FastAPI(title="記帳米粒 ｜ 無痕開團防彈版")
 
 # ==========================================
 # ⚙️ 1. 核心客戶端與資料庫初始化
@@ -169,10 +169,13 @@ def handle_text_message(event):
 
     user_text = event.message.text.strip()
     creator_id = event.source.user_id 
-    is_group = event.source.type == "group"
+    
+    # 🎯 修復 1：無死角涵蓋 LINE 的 group 與 room 類型
+    is_group = event.source.type in ["group", "room"]
     reply_token = event.reply_token 
     
-    target_id = event.source.group_id if is_group else creator_id
+    # 智慧抓取目標 ID
+    target_id = getattr(event.source, "group_id", getattr(event.source, "room_id", creator_id))
     root_collection = "groups" if is_group else "users"
 
     current_mode = "normal"
@@ -242,7 +245,6 @@ def handle_text_message(event):
                 final_payer_id = real_tagged_ids[0]
                 final_receiver_id = creator_id
             else:
-                # 無 Tag 時觸發自行核銷
                 final_payer_id = creator_id
                 final_receiver_id = creator_id
                 
@@ -381,67 +383,78 @@ def handle_text_message(event):
             config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=SuperRouter, temperature=0.3),
         ).parsed
 
-        # 1. AI 萃取記帳 (同步支援群組無痕開團)
-        if result.intent == "record":
-            if result.records:
-                if is_group and current_mode == "normal":
-                    code_str = str(random.randint(1000, 9999))
+        # 🎯 修復 2：整併 Record 與 Order Item 的邏輯，無死角處理常態開團與點單
+        if result.intent in ["record", "order_item"]:
+            real_tagged_ids = get_real_mentions(event)
+            actual_buyer_id = real_tagged_ids[0] if real_tagged_ids else creator_id
+            actual_buyer_name = resolve_id_to_name(target_id, actual_buyer_id)
+
+            if is_group and current_mode == "normal":
+                # 👉 [群組] 常態模式下收到金額 -> 自動無痕開團
+                code_str = str(random.randint(1000, 9999))
+                main_item_name = "團購"
+                temp_items = []
+                
+                if result.intent == "record" and result.records:
                     main_item_name = result.records[0].item
-                    creator_name_str = resolve_id_to_name(target_id, creator_id)
-                    temp_items = []
                     for rec in result.records:
                         if rec.amount > 0:
-                            temp_items.append({
-                                "buyer_id": creator_id, "buyer": creator_name_str,
-                                "item": rec.item, "price": rec.amount, "timestamp": datetime.utcnow().isoformat()
-                            })
-                    if temp_items:
-                        db.collection("groups").document(target_id).update({
-                            "state": "order", "active_order_code": code_str, "order_items_temp": temp_items
-                        })
-                        ai_msg = f"🤖 {result.ai_reply}\n" if result.ai_reply else ""
-                        reply_text = f"{ai_msg}🚀 【{main_item_name} 已開團】\n🔢 本團單號：#{code_str}\n📝 首筆已接單：{creator_name_str} ${temp_items[0]['price']}\n👉 請陸續輸入「@記帳米粒 品項 金額」記載，直到輸入結單截止。"
-                        send_line_reply(reply_token, reply_text)
-                    return
-                else:
-                    creator_name_str = resolve_id_to_name(target_id, creator_id)
+                            temp_items.append({"buyer_id": actual_buyer_id, "buyer": actual_buyer_name, "item": rec.item, "price": rec.amount, "timestamp": datetime.utcnow().isoformat()})
+                elif result.intent == "order_item" and result.order_items:
+                    main_item_name = result.order_items[0].item_name
+                    for item in result.order_items:
+                        if item.price > 0:
+                            clean_item_name = re.sub(r'@\S+', '', item.item_name).strip()
+                            temp_items.append({"buyer_id": actual_buyer_id, "buyer": actual_buyer_name, "item": clean_item_name, "price": item.price, "timestamp": datetime.utcnow().isoformat()})
+                
+                if temp_items:
+                    db.collection("groups").document(target_id).update({"state": "order", "active_order_code": code_str, "order_items_temp": temp_items})
+                    ai_msg = f"🤖 {result.ai_reply}\n" if result.ai_reply else ""
+                    send_line_reply(reply_token, f"{ai_msg}🚀 【{main_item_name} 已開團】\n🔢 本團單號：#{code_str}\n📝 首筆已接單：{actual_buyer_name} ${temp_items[0]['price']}\n👉 請陸續輸入「@記帳米粒 品項 金額」記載，直到輸入結單截止。")
+                return
+
+            elif is_group and current_mode == "order":
+                # 👉 [群組] 開團模式下 -> 繼續跟單
+                g_ref = db.collection("groups").document(target_id)
+                temp_items = g_ref.get().to_dict().get("order_items_temp", [])
+                reply_lines = []
+                
+                if result.intent == "record" and result.records:
+                    for rec in result.records:
+                        if rec.amount > 0:
+                            temp_items.append({"buyer_id": actual_buyer_id, "buyer": actual_buyer_name, "item": rec.item, "price": rec.amount, "timestamp": datetime.utcnow().isoformat()})
+                            reply_lines.append(f"📝 已接單：{rec.item} ${rec.amount}")
+                elif result.intent == "order_item" and result.order_items:
+                    for item in result.order_items:
+                        if item.price > 0:
+                            clean_item_name = re.sub(r'@\S+', '', item.item_name).strip()
+                            temp_items.append({"buyer_id": actual_buyer_id, "buyer": actual_buyer_name, "item": clean_item_name, "price": item.price, "timestamp": datetime.utcnow().isoformat()})
+                            reply_lines.append(f"📝 已接單：{clean_item_name} ${item.price}")
+                
+                if reply_lines:
+                    g_ref.update({"order_items_temp": temp_items})
+                    send_line_reply(reply_token, "\n".join(reply_lines))
+                return
+
+            else:
+                # 👉 [個人] 常態模式 -> 個人記帳落庫
+                if result.intent == "record" and result.records:
                     for rec in result.records:
                         if rec.amount > 0:
                             db.collection(root_collection).document(target_id).collection("expenses").document().set({
                                 "type": rec.record_type, "amount": rec.amount, "item": rec.item, "category": rec.category,
-                                "timestamp": datetime.utcnow(), "created_by_uid": creator_id, "created_by_name": creator_name_str
+                                "timestamp": datetime.utcnow(), "created_by_uid": creator_id, "created_by_name": actual_buyer_name
                             })
                     reply_text = result.ai_reply if result.ai_reply else f"✅ 已為您紀錄花費。"
                     send_line_reply(reply_token, f"🤖 {reply_text}")
+                return
 
-        # 2. 開團模式
+        # 2. 開團模式控制指令
         elif result.intent == "order_start" and is_group:
             code_str = str(random.randint(1000, 9999))
             db.collection("groups").document(target_id).update({"state": "order", "active_order_code": code_str, "order_items_temp": []})
             reply_text = result.ai_reply if result.ai_reply else f"🚀 【團購已啟動】本團單號：#{code_str}\n👉 請大家叫單時記得「@記帳米粒 品項 金額」喔！"
             send_line_reply(reply_token, reply_text)
-
-        # 3. AI 萃取複雜點單與代點單
-        elif result.intent == "order_item" and current_mode == "order" and is_group:
-            if result.order_items:
-                g_ref = db.collection("groups").document(target_id)
-                temp_items = g_ref.get().to_dict().get("order_items_temp", [])
-                
-                real_tagged_ids = get_real_mentions(event)
-                actual_buyer_id = real_tagged_ids[0] if real_tagged_ids else creator_id
-                actual_buyer_name = resolve_id_to_name(target_id, actual_buyer_id)
-                
-                reply_lines = []
-                for item in result.order_items:
-                    clean_item_name = re.sub(r'@\S+', '', item.item_name).strip()
-                    temp_items.append({
-                        "buyer_id": actual_buyer_id, "buyer": actual_buyer_name,
-                        "item": clean_item_name, "price": item.price, "timestamp": datetime.utcnow().isoformat()
-                    })
-                    reply_lines.append(f"📝 已接單：{clean_item_name} ${item.price}")
-                    
-                g_ref.update({"order_items_temp": temp_items})
-                send_line_reply(reply_token, "\n".join(reply_lines))
 
         # 4. 截止結單
         elif result.intent == "order_end" and current_mode == "order" and is_group:
@@ -474,4 +487,4 @@ def handle_text_message(event):
 
 @app.get("/")
 def health_check(): 
-    return {"status": "auto_group_order_active", "version": "v12.0-SaaS"}
+    return {"status": "bulletproof_auto_group", "version": "v13.0"}
